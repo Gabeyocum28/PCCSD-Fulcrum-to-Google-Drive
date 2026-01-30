@@ -244,19 +244,37 @@ class FulcrumToDriveExporter:
         self.drive_creds = creds  # Store for thread-local services
         self.drive_service = build('drive', 'v3', credentials=creds)
 
-        # Find the target folder
-        results = self.drive_service.files().list(
-            q=f"name='{self.drive_folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            spaces='drive',
-            fields='files(id, name)'
-        ).execute()
+        # Find the target folder (supports nested paths like "Parent/Child/Grandchild")
+        folder_path = self.drive_folder_name.split('/')
+        current_folder_id = None
 
-        folders = results.get('files', [])
-        if not folders:
-            logger.error(f"'{self.drive_folder_name}' folder not found in Google Drive")
-            return False
+        for i, folder_name in enumerate(folder_path):
+            folder_name = folder_name.strip()
+            if not folder_name:
+                continue
 
-        self.drive_folder_id = folders[0]['id']
+            if current_folder_id is None:
+                # First folder - search from root
+                query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            else:
+                # Subfolder - search within parent
+                query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{current_folder_id}' in parents and trashed=false"
+
+            results = self.drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+
+            folders = results.get('files', [])
+            if not folders:
+                path_so_far = '/'.join(folder_path[:i+1])
+                logger.error(f"Folder '{folder_name}' not found in path '{path_so_far}'")
+                return False
+
+            current_folder_id = folders[0]['id']
+
+        self.drive_folder_id = current_folder_id
         logger.info(f"Connected to Google Drive folder: {self.drive_folder_name}")
 
         # Get or create active_forms and inactive_forms subfolders
