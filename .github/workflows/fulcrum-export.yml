@@ -64,10 +64,9 @@ jobs:
           if [ -z "$FOLDER" ]; then
             FOLDER="Fulcrum Test"
           fi
-          ARGS="$ARGS --folder=$FOLDER"
 
           echo "Running with folder: $FOLDER"
-          python fulcrum_to_drive.py $ARGS
+          python fulcrum_to_drive.py $ARGS "--folder=$FOLDER"
 
       - name: Upload logs as artifact
         if: always()
