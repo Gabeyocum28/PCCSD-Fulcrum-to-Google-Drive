@@ -59,10 +59,14 @@ jobs:
             ARGS="$ARGS --test"
           fi
 
-          if [ -n "${{ github.event.inputs.drive_folder }}" ]; then
-            ARGS="$ARGS --folder=${{ github.event.inputs.drive_folder }}"
+          # Use input folder or default to "Fulcrum Test"
+          FOLDER="${{ github.event.inputs.drive_folder }}"
+          if [ -z "$FOLDER" ]; then
+            FOLDER="Fulcrum Test"
           fi
+          ARGS="$ARGS --folder=$FOLDER"
 
+          echo "Running with folder: $FOLDER"
           python fulcrum_to_drive.py $ARGS
 
       - name: Upload logs as artifact
