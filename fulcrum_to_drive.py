@@ -375,6 +375,61 @@ class FulcrumToDriveExporter:
 
         return all_files
 
+    def _preload_existing_folders(self):
+        """Preload all existing form folders and their contents to minimize API calls"""
+        logger.info("Pre-loading existing folder structure...")
+
+        # List all folders in active_forms and inactive_forms
+        for parent_name, parent_id in [("active_forms", self.active_forms_id), ("inactive_forms", self.inactive_forms_id)]:
+            if not parent_id:
+                continue
+
+            # Get all form folders
+            form_folders = {}
+            page_token = None
+            while True:
+                results = self.drive_service.files().list(
+                    q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name)',
+                    pageSize=1000,
+                    pageToken=page_token
+                ).execute()
+
+                for f in results.get('files', []):
+                    form_folders[f['name']] = f['id']
+                    # Cache the folder ID
+                    cache_key = f"{parent_id}/{f['name']}"
+                    self._folder_cache[cache_key] = f['id']
+
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
+
+            logger.info(f"  Found {len(form_folders)} existing {parent_name} folders")
+
+            # For each form folder, get its subfolders (photos, geojson)
+            for form_name, form_id in form_folders.items():
+                page_token = None
+                while True:
+                    results = self.drive_service.files().list(
+                        q=f"'{form_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                        spaces='drive',
+                        fields='nextPageToken, files(id, name)',
+                        pageSize=100,
+                        pageToken=page_token
+                    ).execute()
+
+                    for f in results.get('files', []):
+                        cache_key = f"{form_id}/{f['name']}"
+                        self._folder_cache[cache_key] = f['id']
+
+                    page_token = results.get('nextPageToken')
+                    if not page_token:
+                        break
+
+        logger.info(f"  Cached {len(self._folder_cache)} folder IDs")
+
     def _delete_file_if_exists(self, filename: str, parent_id: str) -> bool:
         """Delete a file by name in a folder if it exists"""
         try:
@@ -1467,6 +1522,10 @@ class FulcrumToDriveExporter:
         if not self.init_google_drive():
             logger.error("Failed to initialize Google Drive")
             return
+
+        # Pre-load existing folder structure for faster lookups
+        if not self.skip_existing_check:
+            self._preload_existing_folders()
 
         # Step 1: Export layers
         logger.info("\n" + "-" * 60)
