@@ -16,6 +16,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Set
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.auth.transport.requests import Request
@@ -29,15 +30,25 @@ from tqdm import tqdm
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('fulcrum_to_drive.log'),
-        logging.StreamHandler()
-    ]
-)
+# Utah timezone (Mountain Time)
+UTAH_TZ = ZoneInfo('America/Denver')
+
+# Custom formatter for Utah time
+class UtahTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=UTAH_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+# Configure logging with Utah timezone
+handler_file = logging.FileHandler('fulcrum_to_drive.log')
+handler_console = logging.StreamHandler()
+formatter = UtahTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+handler_file.setFormatter(formatter)
+handler_console.setFormatter(formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[handler_file, handler_console])
 logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -599,7 +610,7 @@ class FulcrumToDriveExporter:
 
         # Create layers manifest
         manifest = {
-            "export_date": datetime.now().isoformat(),
+            "export_date": datetime.now(UTAH_TZ).isoformat(),
             "total_layers": len(layers),
             "layers": [{"id": l.get('id'), "name": l.get('name')} for l in layers]
         }
@@ -624,7 +635,7 @@ class FulcrumToDriveExporter:
             "FAILED PHOTO DOWNLOADS SUMMARY",
             "=" * 70,
             "",
-            f"Generated: {datetime.now().isoformat()}",
+            f"Generated: {datetime.now(UTAH_TZ).isoformat()}",
             f"Total Forms with Failed Photos: {len(sorted_forms)}",
             f"Total Failed Photos: {total_failed}",
             "",
@@ -1268,7 +1279,7 @@ class FulcrumToDriveExporter:
             f"Form Name: {form_name}",
             f"Status: {'ACTIVE' if is_active else 'INACTIVE'}",
             f"Form ID: {form_id}",
-            f"Export Date: {datetime.now().isoformat()}",
+            f"Export Date: {datetime.now(UTAH_TZ).isoformat()}",
             "",
             "-" * 60,
             "STATISTICS",
