@@ -1555,15 +1555,29 @@ class FulcrumToDriveExporter:
                 break
 
             logger.info(f"[{idx}/{len(forms)}] {form['name']}")
-            try:
-                result = self.export_form(form)
-                results.append(result)
 
-                if result.get('export_ended'):
+            # Retry logic for SSL/connection errors
+            result = None
+            for attempt in range(3):
+                try:
+                    result = self.export_form(form)
+                    results.append(result)
+                    break  # Success
+                except (ssl.SSLError, OSError) as e:
+                    if attempt < 2:
+                        logger.warning(f"Connection error, retrying ({attempt + 1}/3)...")
+                        time.sleep(5 * (attempt + 1))
+                        self._refresh_drive_token_if_needed(force=True)
+                    else:
+                        logger.error(f"Failed after 3 attempts: {e}")
+                        results.append({"form": form['name'], "error": str(e)})
+                except Exception as e:
+                    logger.error(f"Failed to export form: {e}")
+                    results.append({"form": form['name'], "error": str(e)})
                     break
-            except Exception as e:
-                logger.error(f"Failed to export form: {e}")
-                results.append({"form": form['name'], "error": str(e)})
+
+            if result and result.get('export_ended'):
+                break
 
         # Print summary
         status = "ENDED EARLY" if self._export_cancelled else "COMPLETE"
