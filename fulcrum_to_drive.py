@@ -159,7 +159,7 @@ class FulcrumToDriveExporter:
         timeout_seconds = timeout_minutes * 60
         poll_interval = 5  # Check every 5 seconds
 
-        logger.info("  Waiting for Slack approval...")
+        logger.debug("  Waiting for Slack approval...")
 
         while time.time() - start_time < timeout_seconds:
             messages = self.get_slack_messages_since(message_ts)
@@ -173,22 +173,18 @@ class FulcrumToDriveExporter:
 
                 # Check for approval
                 if text in ['y', 'yes']:
-                    logger.info("  Approval received via Slack")
                     return 'approve'
 
                 # Check for skip
                 if text in ['s', 'skip']:
-                    logger.info("  Skip requested via Slack")
                     return 'skip'
 
                 # Check for end
                 if text in ['e', 'end']:
-                    logger.info("  End requested via Slack")
                     return 'end'
 
             time.sleep(poll_interval)
 
-        logger.warning("  Slack approval timed out")
         return 'timeout'
 
     def identify_orphaned_photos(self, photos_folder_id: str, photo_metadata_cache: Dict[str, Dict]) -> List[str]:
@@ -281,7 +277,7 @@ class FulcrumToDriveExporter:
             current_folder_id = folders[0]['id']
 
         self.drive_folder_id = current_folder_id
-        logger.info(f"Connected to Google Drive folder: {self.drive_folder_name}")
+        logger.debug(f"Connected to Google Drive folder: {self.drive_folder_name}")
 
         # Get or create active_forms and inactive_forms subfolders
         self.active_forms_id = self._get_or_create_folder("active_forms", self.drive_folder_id)
@@ -289,25 +285,27 @@ class FulcrumToDriveExporter:
 
         return True
 
-    def _refresh_drive_token_if_needed(self):
-        """Refresh Google Drive token if it's been more than 45 minutes"""
+    def _refresh_drive_token_if_needed(self, force: bool = False):
+        """Refresh Google Drive token if it's been more than 45 minutes (or force refresh)"""
         elapsed = time.time() - self._last_token_refresh
-        if elapsed > 45 * 60:  # 45 minutes
+        if force or elapsed > 30 * 60:  # 30 minutes (tokens expire after 1 hour)
             try:
-                if self.drive_creds and self.drive_creds.expired:
-                    logger.info("Refreshing Google Drive token...")
-                    self.drive_creds.refresh(Request())
-                    # Save refreshed token
-                    with open(self._token_path, 'wb') as token:
-                        pickle.dump(self.drive_creds, token)
-                    # Rebuild service with refreshed creds
-                    self.drive_service = build('drive', 'v3', credentials=self.drive_creds)
-                    # Clear thread-local services so they rebuild
-                    self._thread_local = threading.local()
-                    logger.info("Token refreshed successfully")
+                logger.debug("Refreshing Google Drive token...")
+                # Force refresh the credentials
+                self.drive_creds.refresh(Request())
+                # Save refreshed token
+                with open(self._token_path, 'wb') as token:
+                    pickle.dump(self.drive_creds, token)
+                # Rebuild service with refreshed creds
+                self.drive_service = build('drive', 'v3', credentials=self.drive_creds)
+                # Clear thread-local services so they rebuild with new creds
+                self._thread_local = threading.local()
                 self._last_token_refresh = time.time()
+                return True
             except Exception as e:
                 logger.warning(f"Token refresh failed: {e}")
+                return False
+        return True
 
     def _get_thread_service(self):
         """Get a thread-local Drive service for safe concurrent uploads"""
@@ -378,7 +376,7 @@ class FulcrumToDriveExporter:
 
     def _preload_existing_folders(self):
         """Preload all existing form folders and their contents to minimize API calls"""
-        logger.info("Pre-loading existing folder structure...")
+        logger.debug("Pre-loading existing folder structure...")
 
         # List all folders in active_forms and inactive_forms
         for parent_name, parent_id in [("active_forms", self.active_forms_id), ("inactive_forms", self.inactive_forms_id)]:
@@ -407,7 +405,7 @@ class FulcrumToDriveExporter:
                 if not page_token:
                     break
 
-            logger.info(f"  Found {len(form_folders)} existing {parent_name} folders")
+            logger.debug(f"  Found {len(form_folders)} existing {parent_name} folders")
 
             # For each form folder, get its subfolders (photos, geojson)
             for form_name, form_id in form_folders.items():
@@ -429,7 +427,7 @@ class FulcrumToDriveExporter:
                     if not page_token:
                         break
 
-        logger.info(f"  Cached {len(self._folder_cache)} folder IDs")
+        logger.debug(f"  Cached {len(self._folder_cache)} folder IDs")
 
     def _delete_file_if_exists(self, filename: str, parent_id: str) -> bool:
         """Delete a file by name in a folder if it exists"""
@@ -456,12 +454,11 @@ class FulcrumToDriveExporter:
 
         # Auto-skip all deletions if flag is set
         if self.skip_deletions:
-            logger.info(f"  Auto-skipping deletion of {len(orphaned_files)} orphaned photos (--skip-deletions)")
+            logger.debug(f"  Skipped deletion of {len(orphaned_files)} orphaned photos")
             return 0, 'skipped'
 
         # Check if this form is pre-approved (auto-approve without Slack wait)
         if form_name in self._pre_approved_forms:
-            logger.info(f"  Pre-approved: deleting {len(orphaned_files)} photos from {form_name}")
             if self.slack_enabled:
                 self.send_slack_message(f"✅ *Pre-approved:* Deleting {len(orphaned_files)} photos from *{form_name}*")
             deleted_count = self.delete_photos_from_drive(orphaned_files, photos_folder_id)
@@ -487,21 +484,18 @@ class FulcrumToDriveExporter:
                 response = self.wait_for_slack_approval(msg_ts)
 
                 if response == 'skip':
-                    logger.info(f"  Skipping deletion of {len(orphaned_files)} photos (user requested skip)")
                     self._skipped_forms.append({"form": form_name, "reason": "user requested", "photos": len(orphaned_files)})
                     self.send_slack_message(f"✓ Skipped deletion for *{form_name}*")
                     return 0, 'skipped'
 
                 if response == 'end':
-                    logger.info("  Export ending (user requested end)")
                     self.send_slack_message("🛑 Export process ended by user request")
                     self._export_cancelled = True
                     return 0, 'ended'
 
                 if response == 'timeout':
-                    logger.warning(f"  Approval timed out, skipping deletion of {len(orphaned_files)} photos")
                     self._skipped_forms.append({"form": form_name, "reason": "no response", "photos": len(orphaned_files)})
-                    self.send_slack_message(f"⏰ Due to no response, deletion for *{form_name}* has been skipped ({len(orphaned_files)} photos)")
+                    self.send_slack_message(f"⏰ Timeout - skipped deletion for *{form_name}* ({len(orphaned_files)} photos)")
                     return 0, 'skipped'
 
                 # response == 'approve'
@@ -559,7 +553,6 @@ class FulcrumToDriveExporter:
 
     def get_layers(self) -> List[Dict]:
         """Retrieve all layers from Fulcrum"""
-        logger.info("Fetching layers from Fulcrum...")
         try:
             response = requests.get(
                 f"{self.fulcrum_base_url}/layers.json",
@@ -568,7 +561,6 @@ class FulcrumToDriveExporter:
             )
             response.raise_for_status()
             layers = response.json().get('layers', [])
-            logger.info(f"Found {len(layers)} layers")
             return layers
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch layers: {e}")
@@ -579,7 +571,6 @@ class FulcrumToDriveExporter:
         layers = self.get_layers()
 
         if not layers:
-            logger.info("No layers to export")
             return 0
 
         # Get or create layers folder
@@ -617,7 +608,6 @@ class FulcrumToDriveExporter:
         self._upload_to_drive(manifest_json, "LAYERS_MANIFEST.json", layers_folder_id, "application/json")
 
         self.stats["layers_uploaded"] = uploaded
-        logger.info(f"Layers: {uploaded} uploaded, {len(layers) - uploaded} already exist")
         return uploaded
 
     def update_failed_downloads_summary(self) -> None:
@@ -678,7 +668,7 @@ class FulcrumToDriveExporter:
 
     def get_forms(self, since_date: str = None) -> List[Dict]:
         """Get forms from Fulcrum API"""
-        logger.info("Fetching forms from Fulcrum...")
+        logger.debug("Fetching forms from Fulcrum...")
 
         if since_date:
             query = f"""
@@ -709,7 +699,6 @@ class FulcrumToDriveExporter:
                 row['_is_active'] = (row.get('status') == 'active')
                 forms.append(row)
 
-        logger.info(f"Found {len(forms)} forms")
         return forms
 
     def get_form_schema(self, form_id: str) -> Dict:
@@ -1063,6 +1052,10 @@ class FulcrumToDriveExporter:
             return 0
 
         uploaded = 0
+        completed_count = 0
+        timeout_seconds = 60  # 1 minute timeout per record
+        token_refresh_interval = 100
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_record = {
                 executor.submit(self._upload_single_geojson, record, folder_id): record
@@ -1071,9 +1064,22 @@ class FulcrumToDriveExporter:
 
             with tqdm(total=len(to_upload), desc="    GeoJSON", unit="record", leave=False) as pbar:
                 for future in as_completed(future_to_record):
-                    if future.result():
-                        uploaded += 1
+                    try:
+                        if future.result(timeout=timeout_seconds):
+                            uploaded += 1
+                    except TimeoutError:
+                        logger.debug(f"GeoJSON upload timed out")
+                    except Exception as e:
+                        logger.debug(f"GeoJSON upload failed: {e}")
+
+                    completed_count += 1
                     pbar.update(1)
+
+                    # Periodic token refresh
+                    if completed_count % token_refresh_interval == 0:
+                        elapsed = time.time() - self._last_token_refresh
+                        if elapsed > 30 * 60:
+                            self._refresh_drive_token_if_needed(force=True)
 
         return uploaded
 
@@ -1086,7 +1092,7 @@ class FulcrumToDriveExporter:
         # Sanitize form name
         safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in form_name)
 
-        logger.info(f"Processing form: {form_name}")
+        logger.debug(f"Processing form: {form_name}")
 
         # Get or create form folder in Drive
         parent_id = self.active_forms_id if is_active else self.inactive_forms_id
@@ -1094,7 +1100,7 @@ class FulcrumToDriveExporter:
 
         # Get records
         records = self.get_records(form_id)
-        logger.info(f"  Found {len(records)} records")
+        logger.debug(f"  Found {len(records)} records")
 
         if not records:
             # Create empty summary (replace existing)
@@ -1104,13 +1110,10 @@ class FulcrumToDriveExporter:
             return {"form": form_name, "records": 0, "photos_uploaded": 0, "photos_skipped": 0, "photos_failed": 0, "geojson_uploaded": 0}
 
         # Get form schema for proper field labels
-        logger.info("  Fetching form schema...")
         form_schema = self.get_form_schema(form_id)
         field_mapping = self.build_field_mapping(form_schema)
-        logger.info(f"  Built field mapping with {len(field_mapping)} field mappings")
 
         # Build CSV in memory with proper flattening
-        logger.info("  Building CSV...")
         all_flat_records = []
 
         for record in records:
@@ -1159,19 +1162,14 @@ class FulcrumToDriveExporter:
         self._delete_file_if_exists(csv_filename, form_folder_id)
         csv_content = csv_buffer.getvalue().encode('utf-8')
         self._upload_to_drive(csv_content, csv_filename, form_folder_id, "text/csv")
-        logger.info("  CSV uploaded")
 
         # Get or create geojson folder and upload each record as JSON
-        logger.info("  Uploading GeoJSON files...")
         geojson_folder_id = self._get_or_create_folder("geojson", form_folder_id)
-
-        # List existing geojson files in Drive
         existing_geojson = self._list_drive_folder_contents(geojson_folder_id)
 
-        # Upload GeoJSON files concurrently
+        # Refresh token before concurrent uploads if needed
+        self._refresh_drive_token_if_needed()
         geojson_uploaded = self._upload_geojson_concurrent(records, geojson_folder_id, existing_geojson)
-
-        logger.info(f"  GeoJSON: {geojson_uploaded} uploaded, {len(records) - geojson_uploaded} already exist")
 
         # Get or create photos folder
         photos_folder_id = self._get_or_create_folder("photos", form_folder_id)
@@ -1181,41 +1179,29 @@ class FulcrumToDriveExporter:
         for record in records:
             all_photos.extend(self.extract_photo_ids(record))
 
-        logger.info(f"  Form has {len(all_photos)} total photos")
-
         # Check existing photos (skip if --force flag or new folder)
         if self.skip_existing_check:
-            logger.info("  Skipping existence check (--force mode)")
             existing_photos = set()
         else:
-            logger.info("  Checking existing photos in Drive...")
             existing_photos = self._list_drive_folder_contents(photos_folder_id)
-            logger.info(f"  Found {len(existing_photos)} existing photos")
 
         # Filter to only missing photos
         photos_to_download = []
         for photo in all_photos:
             photo_id = photo['photo_id']
-            # Check both .jpg and .png
             if f"{photo_id}.jpg" not in existing_photos and f"{photo_id}.png" not in existing_photos:
                 photos_to_download.append(photo)
 
         skipped = len(all_photos) - len(photos_to_download)
-        logger.info(f"  Skipping {skipped} photos already in Drive")
-        logger.info(f"  Downloading {len(photos_to_download)} missing photos")
 
         # Batch-fetch all photo metadata for this form (needed for downloads AND cleanup)
-        logger.info("  Fetching photo metadata in batch...")
         photo_metadata_cache = self.get_photos_metadata_batch(form_id)
-        logger.info(f"  Got metadata for {len(photo_metadata_cache)} photos")
 
         # Clean up photos that were deleted in Fulcrum (with Slack approval if enabled)
         deleted_count, cleanup_action = self.cleanup_deleted_photos(photos_folder_id, photo_metadata_cache, form_name)
         if cleanup_action == 'ended':
             # User requested to end export via Slack
             return {"form": form_name, "records": len(records), "photos_uploaded": 0, "photos_skipped": skipped, "photos_failed": 0, "photos_deleted": 0, "geojson_uploaded": geojson_uploaded, "export_ended": True}
-        if deleted_count > 0:
-            logger.info(f"  Removed {deleted_count} deleted photos from Drive")
 
         # Download and upload missing photos with retry logic
         failed_photos = []
@@ -1223,6 +1209,8 @@ class FulcrumToDriveExporter:
         all_photo_results = []
 
         if photos_to_download:
+            # Refresh token before concurrent uploads if needed
+            self._refresh_drive_token_if_needed()
 
             # First attempt
             all_photo_results, failed_photos = self._download_and_upload_photos(photos_to_download, photos_folder_id, photo_metadata_cache)
@@ -1234,7 +1222,7 @@ class FulcrumToDriveExporter:
 
             while failed_photos and retry_count < 3:
                 retry_count += 1
-                logger.info(f"  Retry attempt {retry_count} for {len(failed_photos)} failed photos...")
+                logger.debug(f"  Retry attempt {retry_count} for {len(failed_photos)} failed photos...")
 
                 retry_results, still_failed = self._download_and_upload_photos(failed_photos, photos_folder_id, photo_metadata_cache)
                 newly_uploaded = len(failed_photos) - len(still_failed)
@@ -1248,7 +1236,7 @@ class FulcrumToDriveExporter:
                 if len(still_failed) >= previous_failed_count:
                     # No progress made
                     if retry_count >= 2:
-                        logger.info(f"  No progress after {retry_count} retries, giving up on {len(still_failed)} photos")
+                        logger.debug(f"  No progress after {retry_count} retries, giving up on {len(still_failed)} photos")
                         break
                 else:
                     previous_failed_count = len(still_failed)
@@ -1257,26 +1245,22 @@ class FulcrumToDriveExporter:
 
         # Build and upload photos CSVs (delete existing first to replace)
         if all_photo_results:
-            logger.info("  Building photos CSVs...")
             all_csv, before_csv, completed_csv = self.build_photos_csv(all_photo_results)
 
             if all_csv:
                 photos_csv_name = f"{safe_name}_photos.csv"
                 self._delete_file_if_exists(photos_csv_name, form_folder_id)
                 self._upload_to_drive(all_csv, photos_csv_name, form_folder_id, "text/csv")
-                logger.info(f"    Uploaded {photos_csv_name}")
 
             if before_csv:
                 before_csv_name = f"{safe_name}_before_photos.csv"
                 self._delete_file_if_exists(before_csv_name, form_folder_id)
                 self._upload_to_drive(before_csv, before_csv_name, form_folder_id, "text/csv")
-                logger.info(f"    Uploaded {before_csv_name}")
 
             if completed_csv:
                 completed_csv_name = f"{safe_name}_completed_photos.csv"
                 self._delete_file_if_exists(completed_csv_name, form_folder_id)
                 self._upload_to_drive(completed_csv, completed_csv_name, form_folder_id, "text/csv")
-                logger.info(f"    Uploaded {completed_csv_name}")
 
         # Create summary
         summary_lines = [
@@ -1404,6 +1388,9 @@ class FulcrumToDriveExporter:
         Returns: (all_results, failed_photos) where all_results includes metadata for CSV"""
         all_results = []
         failed = []
+        completed_count = 0
+        timeout_seconds = 120  # 2 minute timeout per photo
+        token_refresh_interval = 100  # Refresh token every 100 photos
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_photo = {
@@ -1413,11 +1400,34 @@ class FulcrumToDriveExporter:
 
             with tqdm(total=len(photos), desc="    Photos", unit="photo", leave=False) as pbar:
                 for future in as_completed(future_to_photo):
-                    result = future.result()
-                    all_results.append(result)
-                    if not result.get('success', False):
-                        failed.append(result)
+                    photo = future_to_photo[future]
+                    try:
+                        result = future.result(timeout=timeout_seconds)
+                        all_results.append(result)
+                        if not result.get('success', False):
+                            failed.append(result)
+                    except TimeoutError:
+                        # Photo upload timed out - mark as failed
+                        logger.warning(f"Photo {photo.get('photo_id')} timed out after {timeout_seconds}s")
+                        photo['error'] = f"Timeout after {timeout_seconds}s"
+                        photo['success'] = False
+                        all_results.append(photo)
+                        failed.append(photo)
+                    except Exception as e:
+                        logger.warning(f"Photo {photo.get('photo_id')} failed: {e}")
+                        photo['error'] = str(e)
+                        photo['success'] = False
+                        all_results.append(photo)
+                        failed.append(photo)
+
+                    completed_count += 1
                     pbar.update(1)
+
+                    # Periodic token refresh during long upload batches
+                    if completed_count % token_refresh_interval == 0:
+                        elapsed = time.time() - self._last_token_refresh
+                        if elapsed > 30 * 60:  # Refresh if > 30 min since last refresh
+                            self._refresh_drive_token_if_needed(force=True)
 
         return all_results, failed
 
@@ -1512,17 +1522,10 @@ class FulcrumToDriveExporter:
 
     def export_all(self, since_date: str = None, test_mode: bool = False, max_forms: int = 3):
         """Export all forms to Google Drive"""
-        logger.info("=" * 60)
-        logger.info("FULCRUM TO GOOGLE DRIVE EXPORT")
-        logger.info("=" * 60)
+        logger.info("Starting Fulcrum to Google Drive export...")
 
-        # Log Slack status
         if self.slack_enabled:
-            logger.info("Slack integration: ENABLED (deletion approval required)")
-            # Send startup notification to Slack
-            self.send_slack_message("🚀 *Fulcrum Export Started*\nYou will be notified when photos need deletion approval.")
-        else:
-            logger.info("Slack integration: DISABLED (deletions will be automatic)")
+            self.send_slack_message("🚀 *Fulcrum Export Started*")
 
         # Initialize Google Drive
         if not self.init_google_drive():
@@ -1533,23 +1536,14 @@ class FulcrumToDriveExporter:
         if not self.skip_existing_check:
             self._preload_existing_folders()
 
-        # Step 1: Export layers
-        logger.info("\n" + "-" * 60)
-        logger.info("STEP 1: Exporting Layers")
-        logger.info("-" * 60)
+        # Export layers
         self.export_layers()
-
-        # Step 2: Export forms
-        logger.info("\n" + "-" * 60)
-        logger.info("STEP 2: Exporting Forms")
-        logger.info("-" * 60)
 
         # Get forms
         forms = self.get_forms(since_date)
 
         if test_mode:
             forms = forms[:max_forms]
-            logger.info(f"TEST MODE: Limited to {max_forms} forms")
 
         # Process each form
         results = []
@@ -1557,44 +1551,26 @@ class FulcrumToDriveExporter:
             # Refresh Google Drive token if needed (prevents timeout after ~1 hour)
             self._refresh_drive_token_if_needed()
 
-            # Check if export was cancelled via Slack
             if self._export_cancelled:
-                logger.info("\nExport cancelled by user request")
                 break
 
-            logger.info(f"\n[{idx}/{len(forms)}] {form['name']}")
+            logger.info(f"[{idx}/{len(forms)}] {form['name']}")
             try:
                 result = self.export_form(form)
                 results.append(result)
 
-                # Check if this form's processing triggered an end request
                 if result.get('export_ended'):
-                    logger.info("\nExport ended by user request")
                     break
             except Exception as e:
                 logger.error(f"Failed to export form: {e}")
                 results.append({"form": form['name'], "error": str(e)})
 
         # Print summary
-        logger.info("\n" + "=" * 60)
-        if self._export_cancelled:
-            logger.info("EXPORT ENDED EARLY (user request)")
-        else:
-            logger.info("EXPORT COMPLETE")
-        logger.info("=" * 60)
-        logger.info(f"Layers Uploaded: {self.stats['layers_uploaded']}")
-        logger.info(f"Forms Processed: {self.stats['forms_processed']}")
-        logger.info(f"Total Records: {self.stats['total_records']}")
-        logger.info(f"GeoJSON Files Uploaded: {self.stats['geojson_uploaded']}")
-        logger.info(f"Photos Uploaded: {self.stats['photos_uploaded']}")
-        logger.info(f"Photos Skipped (already in Drive): {self.stats['photos_skipped']}")
-        if self.stats['photos_deleted'] > 0:
-            logger.info(f"Photos Deleted (removed from Fulcrum): {self.stats['photos_deleted']}")
+        status = "ENDED EARLY" if self._export_cancelled else "COMPLETE"
+        logger.info(f"\n=== EXPORT {status} ===")
+        logger.info(f"Forms: {self.stats['forms_processed']} | Records: {self.stats['total_records']} | Photos: {self.stats['photos_uploaded']} uploaded, {self.stats['photos_skipped']} skipped")
         if self.stats['photos_failed'] > 0:
-            logger.warning(f"Photos Failed: {self.stats['photos_failed']}")
-            logger.warning(f"Forms with Failures: {len(self.failed_forms)}")
-            logger.warning("See FAILED_DOWNLOADS_SUMMARY.txt in Google Drive for details")
-        logger.info("=" * 60)
+            logger.warning(f"Failed: {self.stats['photos_failed']} photos in {len(self.failed_forms)} forms")
 
         # Send completion notification to Slack
         if self.slack_enabled:
@@ -1630,9 +1606,8 @@ class FulcrumToDriveExporter:
             try:
                 with open(self._skipped_forms_file, 'w') as f:
                     json.dump(self._skipped_forms, f, indent=2)
-                logger.info(f"Skipped forms saved to {self._skipped_forms_file}")
             except Exception as e:
-                logger.warning(f"Failed to save skipped forms: {e}")
+                logger.debug(f"Failed to save skipped forms: {e}")
 
 
 def load_pre_approved_forms(pre_approved_arg: str) -> List[str]:
@@ -1667,13 +1642,9 @@ def load_pre_approved_forms(pre_approved_arg: str) -> List[str]:
             if 0 <= idx < len(skipped_forms):
                 form_name = skipped_forms[idx]['form']
                 pre_approved.append(form_name)
-                logger.info(f"Pre-approved #{item}: {form_name}")
-            else:
-                logger.warning(f"Invalid form number: {item} (only {len(skipped_forms)} skipped forms)")
         else:
             # It's a form name
             pre_approved.append(item)
-            logger.info(f"Pre-approved: {item}")
 
     return pre_approved
 
@@ -1712,22 +1683,20 @@ def main():
     # Resolve pre-approved forms
     pre_approved_forms = load_pre_approved_forms(pre_approved_arg)
 
-    logger.info(f"Target Google Drive folder: {drive_folder}")
-    if since_date:
-        logger.info(f"Filtering forms since: {since_date}")
+    # Log config
+    modes = []
     if test_mode:
-        logger.info("TEST MODE: Will process max 3 forms")
+        modes.append("test")
     if force_mode:
-        logger.info("FORCE MODE: Skipping existence checks (faster initial sync)")
+        modes.append("force")
     if skip_deletions:
-        logger.info("SKIP DELETIONS: All photo deletions will be skipped")
-    if pre_approved_forms:
-        logger.info(f"Pre-approved forms for deletion: {len(pre_approved_forms)}")
+        modes.append("skip-deletions")
+    mode_str = f" [{', '.join(modes)}]" if modes else ""
+    logger.info(f"Folder: {drive_folder}{mode_str}")
 
     if not auto_confirm:
         response = input("\nProceed with export? (yes/no): ")
         if response.lower() != 'yes':
-            logger.info("Export cancelled")
             return
 
     exporter = FulcrumToDriveExporter(fulcrum_token, drive_folder, pre_approved_forms=pre_approved_forms, skip_existing_check=force_mode, skip_deletions=skip_deletions)
