@@ -47,10 +47,9 @@ SCRIPT_DIR = Path(__file__).parent
 class FulcrumToDriveExporter:
     """Export Fulcrum data directly to Google Drive"""
 
-    def __init__(self, fulcrum_token: str, drive_folder_name: str = "Fulcrum-Auto Update/Initial Sync", pre_approved_forms: List[str] = None, skip_existing_check: bool = False, skip_deletions: bool = False, quick_check: bool = False):
+    def __init__(self, fulcrum_token: str, drive_folder_name: str = "Fulcrum-Auto Update/Initial Sync", pre_approved_forms: List[str] = None, skip_deletions: bool = False, quick_check: bool = False):
         self.fulcrum_token = fulcrum_token
         self.drive_folder_name = drive_folder_name
-        self.skip_existing_check = skip_existing_check  # Skip Drive listings for faster initial sync
         self.skip_deletions = skip_deletions  # Auto-skip all deletion requests
         self.quick_check = quick_check  # Skip entire form if folder exists
         self.fulcrum_base_url = "https://api.fulcrumapp.com/api/v2"
@@ -1180,11 +1179,8 @@ class FulcrumToDriveExporter:
         for record in records:
             all_photos.extend(self.extract_photo_ids(record))
 
-        # Check existing photos (skip if --force flag or new folder)
-        if self.skip_existing_check:
-            existing_photos = set()
-        else:
-            existing_photos = self._list_drive_folder_contents(photos_folder_id)
+        # Check existing photos
+        existing_photos = self._list_drive_folder_contents(photos_folder_id)
 
         # Filter to only missing photos
         photos_to_download = []
@@ -1534,8 +1530,7 @@ class FulcrumToDriveExporter:
             return
 
         # Pre-load existing folder structure for faster lookups
-        if not self.skip_existing_check:
-            self._preload_existing_folders()
+        self._preload_existing_folders()
 
         # Export layers
         self.export_layers()
@@ -1686,7 +1681,6 @@ def main():
     # Parse arguments
     since_date = None
     test_mode = '--test' in sys.argv
-    force_mode = '--force' in sys.argv  # Skip existence checks for faster initial sync
     skip_deletions = '--skip-deletions' in sys.argv  # Auto-skip all deletion requests
     quick_check = '--quick-check' in sys.argv  # Skip forms if folder exists
     drive_folder = "Fulcrum-Auto Update/Initial Sync"
@@ -1714,8 +1708,6 @@ def main():
     modes = []
     if test_mode:
         modes.append("test")
-    if force_mode:
-        modes.append("force")
     if skip_deletions:
         modes.append("skip-deletions")
     if quick_check:
@@ -1728,7 +1720,7 @@ def main():
         if response.lower() != 'yes':
             return
 
-    exporter = FulcrumToDriveExporter(fulcrum_token, drive_folder, pre_approved_forms=pre_approved_forms, skip_existing_check=force_mode, skip_deletions=skip_deletions, quick_check=quick_check)
+    exporter = FulcrumToDriveExporter(fulcrum_token, drive_folder, pre_approved_forms=pre_approved_forms, skip_deletions=skip_deletions, quick_check=quick_check)
     exporter.export_all(since_date=since_date, test_mode=test_mode)
 
 
