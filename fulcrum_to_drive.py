@@ -51,6 +51,9 @@ handler_console.setFormatter(formatter)
 logging.basicConfig(level=logging.INFO, handlers=[handler_file, handler_console])
 logger = logging.getLogger(__name__)
 
+# Suppress file_cache warnings from Google API library
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
+
 SCOPES = ['https://www.googleapis.com/auth/drive']
 SCRIPT_DIR = Path(__file__).parent
 
