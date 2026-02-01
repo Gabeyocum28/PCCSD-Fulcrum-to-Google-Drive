@@ -42,14 +42,31 @@ class UtahTimeFormatter(logging.Formatter):
         return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 # Configure logging with Utah timezone
+# Force immediate flushing for GitHub Actions compatibility
+import sys
 handler_file = logging.FileHandler('fulcrum_to_drive.log')
-handler_console = logging.StreamHandler()
+handler_console = logging.StreamHandler(sys.stdout)
+handler_console.stream = sys.stdout  # Explicit stdout
 formatter = UtahTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
 handler_file.setFormatter(formatter)
 handler_console.setFormatter(formatter)
 
 logging.basicConfig(level=logging.INFO, handlers=[handler_file, handler_console])
 logger = logging.getLogger(__name__)
+
+# Force flush after each log message for GitHub Actions
+class FlushingHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+# Replace console handler with flushing version
+for handler in logger.handlers[:]:
+    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+        logger.removeHandler(handler)
+flushing_handler = FlushingHandler(sys.stdout)
+flushing_handler.setFormatter(formatter)
+logger.addHandler(flushing_handler)
 
 # Suppress file_cache warnings from Google API library
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
@@ -1410,6 +1427,9 @@ class FulcrumToDriveExporter:
         completed_count = 0
         timeout_seconds = 120  # 2 minute timeout per photo
         token_refresh_interval = 100  # Refresh token every 100 photos
+        progress_log_interval = 100  # Log progress every N photos
+        last_progress_log = time.time()
+        progress_time_interval = 60  # Also log at least every 60 seconds
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_photo = {
@@ -1443,6 +1463,13 @@ class FulcrumToDriveExporter:
 
                         completed_count += 1
                         pbar.update(1)
+
+                        # Log progress periodically to keep GitHub Actions log active
+                        now = time.time()
+                        if completed_count % progress_log_interval == 0 or (now - last_progress_log) >= progress_time_interval:
+                            pct = (completed_count / len(photos)) * 100 if photos else 0
+                            logger.info(f"    Photo progress: {completed_count}/{len(photos)} ({pct:.0f}%)")
+                            last_progress_log = now
 
                         # Periodic token refresh during long upload batches
                         if completed_count % token_refresh_interval == 0:
