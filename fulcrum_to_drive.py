@@ -1077,23 +1077,31 @@ class FulcrumToDriveExporter:
             }
 
             with tqdm(total=len(to_upload), desc="    GeoJSON", unit="record", leave=False) as pbar:
-                for future in as_completed(future_to_record):
-                    try:
-                        if future.result(timeout=timeout_seconds):
-                            uploaded += 1
-                    except TimeoutError:
-                        logger.debug(f"GeoJSON upload timed out")
-                    except Exception as e:
-                        logger.debug(f"GeoJSON upload failed: {e}")
+                try:
+                    # Add timeout to as_completed to detect stalls (5 min max wait for any completion)
+                    for future in as_completed(future_to_record, timeout=300):
+                        try:
+                            if future.result(timeout=timeout_seconds):
+                                uploaded += 1
+                        except TimeoutError:
+                            logger.debug(f"GeoJSON upload timed out")
+                        except Exception as e:
+                            logger.debug(f"GeoJSON upload failed: {e}")
 
-                    completed_count += 1
-                    pbar.update(1)
+                        completed_count += 1
+                        pbar.update(1)
 
-                    # Periodic token refresh
-                    if completed_count % token_refresh_interval == 0:
-                        elapsed = time.time() - self._last_token_refresh
-                        if elapsed > 30 * 60:
-                            self._refresh_drive_token_if_needed(force=True)
+                        # Periodic token refresh
+                        if completed_count % token_refresh_interval == 0:
+                            elapsed = time.time() - self._last_token_refresh
+                            if elapsed > 30 * 60:
+                                self._refresh_drive_token_if_needed(force=True)
+                except TimeoutError:
+                    # as_completed timed out - some futures are stuck
+                    pending = len(to_upload) - completed_count
+                    logger.warning(f"GeoJSON upload stalled - {pending} uploads stuck, cancelling")
+                    for future in future_to_record:
+                        future.cancel()
 
         return uploaded
 
@@ -1410,35 +1418,48 @@ class FulcrumToDriveExporter:
             }
 
             with tqdm(total=len(photos), desc="    Photos", unit="photo", leave=False) as pbar:
-                for future in as_completed(future_to_photo):
-                    photo = future_to_photo[future]
-                    try:
-                        result = future.result(timeout=timeout_seconds)
-                        all_results.append(result)
-                        if not result.get('success', False):
-                            failed.append(result)
-                    except TimeoutError:
-                        # Photo upload timed out - mark as failed
-                        logger.warning(f"Photo {photo.get('photo_id')} timed out after {timeout_seconds}s")
-                        photo['error'] = f"Timeout after {timeout_seconds}s"
+                try:
+                    # Add timeout to as_completed to detect stalls (5 min max wait for any completion)
+                    for future in as_completed(future_to_photo, timeout=300):
+                        photo = future_to_photo[future]
+                        try:
+                            result = future.result(timeout=timeout_seconds)
+                            all_results.append(result)
+                            if not result.get('success', False):
+                                failed.append(result)
+                        except TimeoutError:
+                            # Photo upload timed out - mark as failed
+                            logger.warning(f"Photo {photo.get('photo_id')} timed out after {timeout_seconds}s")
+                            photo['error'] = f"Timeout after {timeout_seconds}s"
+                            photo['success'] = False
+                            all_results.append(photo)
+                            failed.append(photo)
+                        except Exception as e:
+                            logger.warning(f"Photo {photo.get('photo_id')} failed: {e}")
+                            photo['error'] = str(e)
+                            photo['success'] = False
+                            all_results.append(photo)
+                            failed.append(photo)
+
+                        completed_count += 1
+                        pbar.update(1)
+
+                        # Periodic token refresh during long upload batches
+                        if completed_count % token_refresh_interval == 0:
+                            elapsed = time.time() - self._last_token_refresh
+                            if elapsed > 30 * 60:  # Refresh if > 30 min since last refresh
+                                self._refresh_drive_token_if_needed(force=True)
+                except TimeoutError:
+                    # as_completed timed out - all workers are stuck
+                    pending_futures = [f for f in future_to_photo if not f.done()]
+                    logger.warning(f"Photo uploads stalled - {len(pending_futures)} photos stuck, marking as failed")
+                    for future in pending_futures:
+                        photo = future_to_photo[future]
+                        photo['error'] = "Stalled (worker hung)"
                         photo['success'] = False
                         all_results.append(photo)
                         failed.append(photo)
-                    except Exception as e:
-                        logger.warning(f"Photo {photo.get('photo_id')} failed: {e}")
-                        photo['error'] = str(e)
-                        photo['success'] = False
-                        all_results.append(photo)
-                        failed.append(photo)
-
-                    completed_count += 1
-                    pbar.update(1)
-
-                    # Periodic token refresh during long upload batches
-                    if completed_count % token_refresh_interval == 0:
-                        elapsed = time.time() - self._last_token_refresh
-                        if elapsed > 30 * 60:  # Refresh if > 30 min since last refresh
-                            self._refresh_drive_token_if_needed(force=True)
+                        future.cancel()
 
         return all_results, failed
 
