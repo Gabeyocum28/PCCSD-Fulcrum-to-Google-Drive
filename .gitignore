@@ -13,7 +13,7 @@ env/
 
 # Logs
 *.log
-fulcrum_to_drive.log
+fulcrum_to_google_drive.log
 
 # State files
 skipped_forms.json

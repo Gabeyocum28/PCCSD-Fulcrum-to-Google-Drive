@@ -84,7 +84,7 @@ jobs:
           fi
 
           echo "Running with folder: $FOLDER"
-          python fulcrum_to_drive.py $ARGS "--folder=$FOLDER"
+          python fulcrum_to_google_drive.py $ARGS "--folder=$FOLDER"
 
       - name: Upload logs as artifact
         if: always()
@@ -92,6 +92,6 @@ jobs:
         with:
           name: export-logs
           path: |
-            fulcrum_to_drive.log
+            fulcrum_to_google_drive.log
             skipped_forms.json
           retention-days: 7

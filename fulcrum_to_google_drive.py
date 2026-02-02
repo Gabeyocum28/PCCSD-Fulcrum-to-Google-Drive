@@ -44,7 +44,7 @@ class UtahTimeFormatter(logging.Formatter):
 # Configure logging with Utah timezone
 # Force immediate flushing for GitHub Actions compatibility
 import sys
-handler_file = logging.FileHandler('fulcrum_to_drive.log')
+handler_file = logging.FileHandler('fulcrum_to_google_drive.log')
 handler_console = logging.StreamHandler(sys.stdout)
 handler_console.stream = sys.stdout  # Explicit stdout
 formatter = UtahTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
