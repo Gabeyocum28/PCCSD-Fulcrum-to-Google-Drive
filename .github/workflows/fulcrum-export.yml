@@ -27,6 +27,11 @@ on:
         description: 'Google Drive folder name'
         required: false
         default: 'Fulcrum-Auto Update/Initial Sync'
+      clear_state:
+        description: 'Clear previous state and start fresh'
+        required: false
+        type: boolean
+        default: false
 
   # Scheduled run (optional - uncomment to enable)
   # schedule:
@@ -35,7 +40,7 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hour max (adjust as needed)
+    timeout-minutes: 360  # 6 hour max (GitHub Actions limit)
 
     steps:
       - name: Checkout repository
@@ -55,6 +60,34 @@ jobs:
           echo "${{ secrets.GOOGLE_TOKEN_PICKLE }}" | base64 --decode > token.pickle
           ls -la token.pickle
           echo "Google Drive credentials restored ($(wc -c < token.pickle) bytes)"
+
+      - name: Download previous state (for continuation)
+        if: ${{ github.event.inputs.clear_state != 'true' }}
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: fulcrum-export.yml
+          name: export-state
+          path: .
+          if_no_artifact_found: ignore
+        continue-on-error: true
+
+      - name: Check for continuation state
+        run: |
+          if [ -f "export_state.json" ]; then
+            echo "Found continuation state:"
+            cat export_state.json
+            echo ""
+            echo "CONTINUATION_MODE=true" >> $GITHUB_ENV
+          else
+            echo "No continuation state found - starting fresh"
+            echo "CONTINUATION_MODE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Clear state if requested
+        if: ${{ github.event.inputs.clear_state == 'true' }}
+        run: |
+          rm -f export_state.json export_progress.json
+          echo "Cleared previous state files"
 
       - name: Run Fulcrum Export
         env:
@@ -95,3 +128,29 @@ jobs:
             fulcrum_to_google_drive.log
             skipped_forms.json
           retention-days: 7
+
+      - name: Upload state for continuation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-state
+          path: |
+            export_state.json
+            export_progress.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Check if continuation needed
+        if: always()
+        run: |
+          if [ -f "export_state.json" ]; then
+            NEEDS_CONTINUATION=$(cat export_state.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('needs_continuation', False))" 2>/dev/null || echo "false")
+            if [ "$NEEDS_CONTINUATION" = "True" ]; then
+              echo "::warning::Export paused due to timeout. Re-run this workflow to continue from where it left off."
+              echo ""
+              echo "=== CONTINUATION REQUIRED ==="
+              echo "The export was paused to avoid GitHub Actions timeout."
+              echo "Simply re-run this workflow to continue from form $(cat export_state.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('form_index', 0))")."
+              echo ""
+            fi
+          fi

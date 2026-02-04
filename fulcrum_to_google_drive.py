@@ -26,9 +26,15 @@ from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 from tqdm import tqdm
+import atexit
+import signal
 
 # Load environment variables
 load_dotenv()
+
+# Timeout configuration (in seconds)
+# GitHub Actions has 6-hour limit; we save state at 5h45m to allow graceful exit
+WORKFLOW_TIMEOUT_SECONDS = 5 * 60 * 60 + 45 * 60  # 5 hours 45 minutes
 
 # Utah timezone (Mountain Time)
 UTAH_TZ = ZoneInfo('America/Denver')
@@ -123,6 +129,14 @@ class FulcrumToDriveExporter:
         self._skipped_forms = []  # Track forms skipped due to timeout or user request
         self._pre_approved_forms = set(pre_approved_forms) if pre_approved_forms else set()
         self._skipped_forms_file = SCRIPT_DIR / 'skipped_forms.json'  # Persist skipped forms for re-runs
+
+        # Progress tracking for resume functionality
+        self._progress_file = SCRIPT_DIR / 'export_progress.json'
+        self._uploaded_photos = set()  # Track photos uploaded in this session + previous
+        self._export_start_time = None  # Track when export started for timeout
+        self._timeout_seconds = WORKFLOW_TIMEOUT_SECONDS
+        self._state_file = SCRIPT_DIR / 'export_state.json'  # For workflow chaining
+        self._current_form_index = 0  # Track progress for state saving
 
     def send_slack_message(self, text: str) -> str:
         """Send a message to Slack channel, returns message timestamp or None on failure"""
@@ -459,6 +473,89 @@ class FulcrumToDriveExporter:
                         break
 
         logger.debug(f"  Cached {len(self._folder_cache)} folder IDs")
+
+    def _load_photo_progress(self):
+        """Load previously uploaded photos from progress file"""
+        if self._progress_file.exists():
+            try:
+                with open(self._progress_file, 'r') as f:
+                    data = json.load(f)
+                    self._uploaded_photos = set(data.get('uploaded_photos', []))
+                    logger.info(f"Loaded progress: {len(self._uploaded_photos)} photos already uploaded")
+            except Exception as e:
+                logger.warning(f"Failed to load progress file: {e}")
+                self._uploaded_photos = set()
+
+    def _save_photo_progress(self):
+        """Save uploaded photos to progress file for resume"""
+        try:
+            with open(self._progress_file, 'w') as f:
+                json.dump({
+                    'uploaded_photos': list(self._uploaded_photos),
+                    'last_updated': datetime.now(UTAH_TZ).isoformat()
+                }, f)
+        except Exception as e:
+            logger.warning(f"Failed to save progress: {e}")
+
+    def _record_photo_uploaded(self, photo_id: str):
+        """Record a successfully uploaded photo"""
+        self._uploaded_photos.add(photo_id)
+        # Save progress periodically (every 100 photos to avoid excessive writes)
+        if len(self._uploaded_photos) % 100 == 0:
+            self._save_photo_progress()
+
+    def _is_photo_uploaded(self, photo_id: str) -> bool:
+        """Check if a photo was already uploaded in a previous run"""
+        return photo_id in self._uploaded_photos
+
+    def _check_timeout(self) -> bool:
+        """Check if we're approaching the workflow timeout"""
+        if self._export_start_time is None:
+            return False
+        elapsed = time.time() - self._export_start_time
+        return elapsed >= self._timeout_seconds
+
+    def _save_export_state(self, form_index: int, forms: List[Dict]):
+        """Save export state for workflow chaining continuation"""
+        try:
+            state = {
+                'form_index': form_index,
+                'total_forms': len(forms),
+                'stats': self.stats,
+                'timestamp': datetime.now(UTAH_TZ).isoformat(),
+                'needs_continuation': True
+            }
+            with open(self._state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            # Also save photo progress
+            self._save_photo_progress()
+            logger.info(f"Saved export state at form {form_index}/{len(forms)} for continuation")
+        except Exception as e:
+            logger.error(f"Failed to save export state: {e}")
+
+    def _load_export_state(self) -> Dict:
+        """Load previous export state if exists"""
+        if self._state_file.exists():
+            try:
+                with open(self._state_file, 'r') as f:
+                    state = json.load(f)
+                    if state.get('needs_continuation'):
+                        logger.info(f"Found continuation state: form {state.get('form_index')}/{state.get('total_forms')}")
+                        return state
+            except Exception as e:
+                logger.warning(f"Failed to load export state: {e}")
+        return None
+
+    def _clear_export_state(self):
+        """Clear export state after successful completion"""
+        try:
+            if self._state_file.exists():
+                self._state_file.unlink()
+            if self._progress_file.exists():
+                self._progress_file.unlink()
+            logger.debug("Cleared export state files")
+        except Exception as e:
+            logger.warning(f"Failed to clear state files: {e}")
 
     def _delete_file_if_exists(self, filename: str, parent_id: str) -> bool:
         """Delete a file by name in a folder if it exists"""
@@ -1074,7 +1171,7 @@ class FulcrumToDriveExporter:
         record_json = json.dumps(record, indent=2, ensure_ascii=False).encode('utf-8')
         return self._upload_to_drive(record_json, filename, folder_id, "application/json", use_thread_service=True)
 
-    def _upload_geojson_concurrent(self, records: List[Dict], folder_id: str, existing_files: Set[str], max_workers: int = 15) -> int:
+    def _upload_geojson_concurrent(self, records: List[Dict], folder_id: str, existing_files: Set[str], max_workers: int = 5) -> int:
         """Upload GeoJSON files concurrently, returns count of uploaded files"""
         # Filter to only records that need uploading
         to_upload = [r for r in records if f"{r.get('id')}.json" not in existing_files]
@@ -1221,12 +1318,17 @@ class FulcrumToDriveExporter:
         # Check existing photos
         existing_photos = self._list_drive_folder_contents(photos_folder_id)
 
-        # Filter to only missing photos
+        # Filter to only missing photos (check Drive AND progress file)
         photos_to_download = []
         for photo in all_photos:
             photo_id = photo['photo_id']
-            if f"{photo_id}.jpg" not in existing_photos and f"{photo_id}.png" not in existing_photos:
-                photos_to_download.append(photo)
+            # Skip if already in Drive
+            if f"{photo_id}.jpg" in existing_photos or f"{photo_id}.png" in existing_photos:
+                continue
+            # Skip if uploaded in a previous run (from progress file)
+            if self._is_photo_uploaded(photo_id):
+                continue
+            photos_to_download.append(photo)
 
         skipped = len(all_photos) - len(photos_to_download)
 
@@ -1413,13 +1515,14 @@ class FulcrumToDriveExporter:
             photo['success'] = False
             return photo
 
-        # Success - return photo info with metadata for CSV
+        # Success - record upload and return photo info with metadata for CSV
+        self._record_photo_uploaded(photo_id)
         photo['success'] = True
         photo['photo_data'] = photo_data
         photo['filename'] = filename
         return photo
 
-    def _download_and_upload_photos(self, photos: List[Dict], photos_folder_id: str, photo_metadata_cache: Dict = None, max_workers: int = 15) -> tuple:
+    def _download_and_upload_photos(self, photos: List[Dict], photos_folder_id: str, photo_metadata_cache: Dict = None, max_workers: int = 5) -> tuple:
         """Download photos from Fulcrum and upload to Drive concurrently
         Returns: (all_results, failed_photos) where all_results includes metadata for CSV"""
         all_results = []
@@ -1581,10 +1684,49 @@ class FulcrumToDriveExporter:
 
     def export_all(self, since_date: str = None, test_mode: bool = False, max_forms: int = 3):
         """Export all forms to Google Drive"""
-        logger.info("Starting Fulcrum to Google Drive export...")
+        # Set export start time for timeout tracking
+        self._export_start_time = time.time()
+        self._forms_list = None  # Will be set later for signal handler
 
-        if self.slack_enabled:
-            self.send_slack_message("🚀 *Fulcrum Export Started*")
+        # Set up signal handler for graceful shutdown (e.g., GitHub Actions timeout)
+        def handle_shutdown(signum, frame):
+            logger.warning(f"Received shutdown signal ({signum}), saving state...")
+            if self._forms_list:
+                self._save_export_state(self._current_form_index, self._forms_list)
+            self._save_photo_progress()
+            logger.info("State saved. Re-run workflow to continue.")
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
+
+        # Also register atexit handler as backup
+        def save_on_exit():
+            if self._forms_list and self._current_form_index < len(self._forms_list):
+                self._save_photo_progress()
+
+        atexit.register(save_on_exit)
+
+        # Check for continuation from previous run
+        previous_state = self._load_export_state()
+        start_form_index = 0
+        if previous_state:
+            start_form_index = previous_state.get('form_index', 0)
+            # Restore stats from previous run
+            prev_stats = previous_state.get('stats', {})
+            for key in prev_stats:
+                if key in self.stats:
+                    self.stats[key] = prev_stats[key]
+            logger.info(f"Resuming export from form {start_form_index} (previous stats restored)")
+            if self.slack_enabled:
+                self.send_slack_message(f"🔄 *Fulcrum Export Resuming* from form {start_form_index}")
+        else:
+            logger.info("Starting Fulcrum to Google Drive export...")
+            if self.slack_enabled:
+                self.send_slack_message("🚀 *Fulcrum Export Started*")
+
+        # Load photo progress for resume functionality
+        self._load_photo_progress()
 
         # Initialize Google Drive
         if not self.init_google_drive():
@@ -1594,8 +1736,9 @@ class FulcrumToDriveExporter:
         # Pre-load existing folder structure for faster lookups
         self._preload_existing_folders()
 
-        # Export layers
-        self.export_layers()
+        # Export layers (only on fresh start)
+        if start_form_index == 0:
+            self.export_layers()
 
         # Get forms
         forms = self.get_forms(since_date)
@@ -1603,9 +1746,30 @@ class FulcrumToDriveExporter:
         if test_mode:
             forms = forms[:max_forms]
 
-        # Process each form
+        # Store forms list for signal handler
+        self._forms_list = forms
+
+        # Flag to track if we hit timeout
+        timeout_triggered = False
+
+        # Process each form (starting from continuation point if applicable)
         results = []
         for idx, form in enumerate(forms, 1):
+            # Skip forms already processed in previous run
+            if idx - 1 < start_form_index:
+                continue
+
+            self._current_form_index = idx - 1  # Track for state saving
+            # Check for approaching timeout (workflow chaining)
+            if self._check_timeout():
+                logger.warning(f"Approaching workflow timeout - saving state for continuation")
+                self._save_export_state(idx - 1, forms)  # Save current position (0-indexed)
+                timeout_triggered = True
+                if self.slack_enabled:
+                    remaining = len(forms) - (idx - 1)
+                    self.send_slack_message(f"⏰ *Export paused* at form {idx-1}/{len(forms)} due to timeout. {remaining} forms remaining. Re-run workflow to continue.")
+                break
+
             # Refresh Google Drive token if needed (prevents timeout after ~1 hour)
             self._refresh_drive_token_if_needed()
 
@@ -1648,8 +1812,19 @@ class FulcrumToDriveExporter:
             if result and result.get('export_ended'):
                 break
 
+        # Save final photo progress
+        self._save_photo_progress()
+
         # Print summary
-        status = "ENDED EARLY" if self._export_cancelled else "COMPLETE"
+        if timeout_triggered:
+            status = "PAUSED (timeout)"
+        elif self._export_cancelled:
+            status = "ENDED EARLY"
+        else:
+            status = "COMPLETE"
+            # Clear state files on successful completion
+            self._clear_export_state()
+
         logger.info(f"\n=== EXPORT {status} ===")
         logger.info(f"Forms: {self.stats['forms_processed']} | Records: {self.stats['total_records']} | Photos: {self.stats['photos_uploaded']} uploaded, {self.stats['photos_skipped']} skipped")
         if self.stats['photos_failed'] > 0:
@@ -1657,7 +1832,10 @@ class FulcrumToDriveExporter:
 
         # Send completion notification to Slack
         if self.slack_enabled:
-            if self._export_cancelled:
+            if timeout_triggered:
+                status_emoji = "⏰"
+                status_text = "Export Paused (timeout - re-run to continue)"
+            elif self._export_cancelled:
                 status_emoji = "🛑"
                 status_text = "Export Ended Early"
             elif self._skipped_forms:
