@@ -84,10 +84,11 @@ SCRIPT_DIR = Path(__file__).parent
 class FulcrumToDriveExporter:
     """Export Fulcrum data directly to Google Drive"""
 
-    def __init__(self, fulcrum_token: str, drive_folder_name: str = "Fulcrum-Auto Update/Initial Sync", pre_approved_forms: List[str] = None, skip_deletions: bool = False, quick_check: bool = False):
+    def __init__(self, fulcrum_token: str, drive_folder_name: str = "Fulcrum-Auto Update/Initial Sync", pre_approved_forms: List[str] = None, skip_deletions: bool = False, auto_delete: bool = False, quick_check: bool = False):
         self.fulcrum_token = fulcrum_token
         self.drive_folder_name = drive_folder_name
         self.skip_deletions = skip_deletions  # Auto-skip all deletion requests
+        self.auto_delete = auto_delete  # Auto-delete all orphaned photos without approval
         self.quick_check = quick_check  # Skip entire form if folder exists
         self.fulcrum_base_url = "https://api.fulcrumapp.com/api/v2"
         self.fulcrum_headers = {
@@ -585,6 +586,14 @@ class FulcrumToDriveExporter:
             logger.debug(f"  Skipped deletion of {len(orphaned_files)} orphaned photos")
             return 0, 'skipped'
 
+        # Auto-delete all orphaned photos without approval
+        if self.auto_delete:
+            logger.info(f"  Auto-deleting {len(orphaned_files)} orphaned photos from {form_name}")
+            if self.slack_enabled:
+                self.send_slack_message(f"🗑️ *Auto-delete:* Removing {len(orphaned_files)} orphaned photos from *{form_name}*")
+            deleted_count = self.delete_photos_from_drive(orphaned_files, photos_folder_id)
+            return deleted_count, 'approved'
+
         # Check if this form is pre-approved (auto-approve without Slack wait)
         if form_name in self._pre_approved_forms:
             if self.slack_enabled:
@@ -739,8 +748,10 @@ class FulcrumToDriveExporter:
         return uploaded
 
     def update_failed_downloads_summary(self) -> None:
-        """Update the master failed downloads summary in Google Drive"""
+        """Update the master failed downloads summary in Google Drive.
+        If no forms have failures, deletes the summary file."""
         if not self.failed_forms:
+            self._delete_file_if_exists("FAILED_DOWNLOADS_SUMMARY.txt", self.drive_folder_id)
             return
 
         # Sort by failed count (most failures first)
@@ -1400,6 +1411,9 @@ class FulcrumToDriveExporter:
                 self._delete_file_if_exists(completed_csv_name, form_folder_id)
                 self._upload_to_drive(completed_csv, completed_csv_name, form_folder_id, "text/csv")
 
+        # Count actual photos in Drive after cleanup and uploads
+        photos_in_drive = len(self._list_drive_folder_contents(photos_folder_id))
+
         # Create summary
         summary_lines = [
             "=" * 60,
@@ -1417,11 +1431,9 @@ class FulcrumToDriveExporter:
             "",
             f"Total Records: {len(records)}",
             f"GeoJSON Files: {len(records)}",
-            f"Total Photos in Form: {len(all_photos)}",
-            f"Photos Already in Drive: {skipped}",
-            f"Photos Uploaded: {uploaded}",
+            f"Total Photos in Fulcrum: {len(all_photos)}",
+            f"Total Photos in Drive: {photos_in_drive}",
             f"Photos Failed: {len(failed_photos)}",
-            f"Photos Deleted (removed from Fulcrum): {deleted_count}",
             "",
             "-" * 60,
             "EXPORTED FILES",
@@ -1429,7 +1441,7 @@ class FulcrumToDriveExporter:
             "",
             f"- {safe_name}_data.csv",
             f"- geojson/ ({len(records)} JSON files)",
-            f"- photos/ ({len(all_photos) - len(failed_photos)} image files)",
+            f"- photos/ ({photos_in_drive} image files)",
         ]
 
         if all_photo_results:
@@ -1470,7 +1482,8 @@ class FulcrumToDriveExporter:
         self.stats["geojson_uploaded"] += geojson_uploaded
         self.stats["total_records"] += len(records)
 
-        # Track forms with failed photos
+        # Update failed forms tracking (remove old entry for this form first)
+        self.failed_forms = [f for f in self.failed_forms if f['name'] != form_name]
         if failed_photos:
             folder_type = "active_forms" if is_active else "inactive_forms"
             self.failed_forms.append({
@@ -1479,8 +1492,8 @@ class FulcrumToDriveExporter:
                 "failed_count": len(failed_photos),
                 "path": f"{folder_type}/{safe_name}"
             })
-            # Update the master failed downloads summary
-            self.update_failed_downloads_summary()
+        # Always update the summary (removes file if no failures remain)
+        self.update_failed_downloads_summary()
 
         return {
             "form": form_name,
@@ -1922,6 +1935,7 @@ def main():
     since_date = None
     test_mode = '--test' in sys.argv
     skip_deletions = '--skip-deletions' in sys.argv  # Auto-skip all deletion requests
+    auto_delete = '--auto-delete' in sys.argv  # Auto-delete all orphaned photos
     quick_check = '--quick-check' in sys.argv  # Skip forms if folder exists
     drive_folder = "Fulcrum-Auto Update/Initial Sync"
     pre_approved_arg = None
@@ -1950,6 +1964,8 @@ def main():
         modes.append("test")
     if skip_deletions:
         modes.append("skip-deletions")
+    if auto_delete:
+        modes.append("auto-delete")
     if quick_check:
         modes.append("quick-check")
     mode_str = f" [{', '.join(modes)}]" if modes else ""
@@ -1960,7 +1976,7 @@ def main():
         if response.lower() != 'yes':
             return
 
-    exporter = FulcrumToDriveExporter(fulcrum_token, drive_folder, pre_approved_forms=pre_approved_forms, skip_deletions=skip_deletions, quick_check=quick_check)
+    exporter = FulcrumToDriveExporter(fulcrum_token, drive_folder, pre_approved_forms=pre_approved_forms, skip_deletions=skip_deletions, auto_delete=auto_delete, quick_check=quick_check)
     exporter.export_all(since_date=since_date, test_mode=test_mode)
 
 

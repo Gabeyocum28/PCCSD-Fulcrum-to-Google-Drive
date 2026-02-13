@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      auto_delete:
+        description: 'Auto-delete all orphaned photos without approval'
+        required: false
+        type: boolean
+        default: false
       quick_check:
         description: 'Quick check - skip forms if folder exists'
         required: false
@@ -104,6 +109,10 @@ jobs:
 
           if [ "${{ github.event.inputs.skip_deletions }}" = "true" ]; then
             ARGS="$ARGS --skip-deletions"
+          fi
+
+          if [ "${{ github.event.inputs.auto_delete }}" = "true" ]; then
+            ARGS="$ARGS --auto-delete"
           fi
 
           if [ "${{ github.event.inputs.quick_check }}" = "true" ]; then
