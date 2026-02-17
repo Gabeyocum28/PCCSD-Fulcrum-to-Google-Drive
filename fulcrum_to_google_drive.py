@@ -50,29 +50,25 @@ class UtahTimeFormatter(logging.Formatter):
 # Configure logging with Utah timezone
 # Force immediate flushing for GitHub Actions compatibility
 import sys
-handler_file = logging.FileHandler('fulcrum_to_google_drive.log')
-handler_console = logging.StreamHandler(sys.stdout)
-handler_console.stream = sys.stdout  # Explicit stdout
-formatter = UtahTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
-handler_file.setFormatter(formatter)
-handler_console.setFormatter(formatter)
 
-logging.basicConfig(level=logging.INFO, handlers=[handler_file, handler_console])
-logger = logging.getLogger(__name__)
-
-# Force flush after each log message for GitHub Actions
 class FlushingHandler(logging.StreamHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
 
-# Replace console handler with flushing version
-for handler in logger.handlers[:]:
-    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-        logger.removeHandler(handler)
-flushing_handler = FlushingHandler(sys.stdout)
-flushing_handler.setFormatter(formatter)
-logger.addHandler(flushing_handler)
+formatter = UtahTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+
+handler_file = logging.FileHandler('fulcrum_to_google_drive.log')
+handler_file.setFormatter(formatter)
+
+handler_console = FlushingHandler(sys.stdout)
+handler_console.setFormatter(formatter)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(handler_file)
+logger.addHandler(handler_console)
+logger.propagate = False  # Prevent duplicate output from root logger
 
 # Suppress file_cache warnings from Google API library
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
@@ -256,12 +252,39 @@ class FulcrumToDriveExporter:
         return orphaned
 
     def delete_photos_from_drive(self, filenames: List[str], photos_folder_id: str) -> int:
-        """Delete specific photos from Drive folder, returns count deleted"""
+        """Delete specific photos from Drive folder, returns count deleted.
+        Lists folder once to get file IDs, then deletes by ID (avoids N list queries)."""
+        filenames_to_delete = set(filenames)
+
+        # Single list call to get all file IDs in the folder
+        file_id_map = {}
+        page_token = None
+        while True:
+            results = self.drive_service.files().list(
+                q=f"'{photos_folder_id}' in parents and trashed=false",
+                spaces='drive',
+                fields='nextPageToken, files(id, name)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            for f in results.get('files', []):
+                if f['name'] in filenames_to_delete:
+                    file_id_map[f['name']] = f['id']
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+
+        # Delete by ID (1 API call per file instead of 2)
         deleted = 0
-        for filename in filenames:
-            if self._delete_file_if_exists(filename, photos_folder_id):
+        for filename, file_id in file_id_map.items():
+            try:
+                self.drive_service.files().delete(fileId=file_id).execute()
                 deleted += 1
-                logger.debug(f"Deleted orphaned photo: {filename}")
+            except HttpError as e:
+                logger.debug(f"Error deleting {filename}: {e}")
+
+        # Invalidate contents cache since we modified the folder
+        self._contents_cache.pop(photos_folder_id, None)
         return deleted
 
     def init_google_drive(self):
@@ -537,6 +560,38 @@ class FulcrumToDriveExporter:
             logger.debug("Cleared export state files")
         except Exception as e:
             logger.warning(f"Failed to clear state files: {e}")
+
+    def _clear_folder_contents(self, folder_id: str) -> int:
+        """Delete all files and subfolders inside a Drive folder. Returns count deleted."""
+        # List all items first, then delete (avoids pagination shift during deletion)
+        all_items = []
+        page_token = None
+        while True:
+            results = self.drive_service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                spaces='drive',
+                fields='nextPageToken, files(id, name, mimeType)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            all_items.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+
+        deleted = 0
+        for f in all_items:
+            try:
+                if f['mimeType'] == 'application/vnd.google-apps.folder':
+                    deleted += self._clear_folder_contents(f['id'])
+                self.drive_service.files().delete(fileId=f['id']).execute()
+                deleted += 1
+            except HttpError as e:
+                logger.debug(f"Error deleting {f['name']}: {e}")
+
+        # Invalidate cache for this folder
+        self._contents_cache.pop(folder_id, None)
+        return deleted
 
     def _delete_file_if_exists(self, filename: str, parent_id: str) -> bool:
         """Delete a file by name in a folder if it exists"""
@@ -1233,10 +1288,12 @@ class FulcrumToDriveExporter:
         logger.debug(f"  Found {len(records)} records")
 
         if not records:
-            # Create empty summary (replace existing)
-            summary = f"Form: {form_name}\nRecords: 0\nPhotos: 0\n"
-            self._delete_file_if_exists("FORM_SUMMARY.txt", form_folder_id)
-            self._upload_to_drive(summary.encode(), "FORM_SUMMARY.txt", form_folder_id, "text/plain")
+            # Clear all old data from the folder since this form has no records
+            cleared = self._clear_folder_contents(form_folder_id)
+            if cleared > 0:
+                logger.info(f"  Cleared {cleared} old files from empty form folder")
+            self._upload_to_drive(b"This form has no records in Fulcrum.", "NO_RECORDS.txt", form_folder_id, "text/plain")
+            self.stats["forms_processed"] += 1
             return {"form": form_name, "records": 0, "photos_uploaded": 0, "photos_skipped": 0, "photos_failed": 0, "geojson_uploaded": 0}
 
         # Get form schema for proper field labels
@@ -1394,8 +1451,8 @@ class FulcrumToDriveExporter:
                 self._delete_file_if_exists(completed_csv_name, form_folder_id)
                 self._upload_to_drive(completed_csv, completed_csv_name, form_folder_id, "text/csv")
 
-        # Count actual photos in Drive after cleanup and uploads
-        photos_in_drive = len(self._list_drive_folder_contents(photos_folder_id))
+        # Count actual photos in Drive after cleanup and uploads (bypass cache - contents changed)
+        photos_in_drive = len(self._list_drive_folder_contents(photos_folder_id, use_cache=False))
 
         # Create summary
         summary_lines = [
