@@ -421,8 +421,9 @@ class FulcrumToDriveExporter:
         return all_files
 
     def _preload_existing_folders(self):
-        """Preload all existing form folders and their contents to minimize API calls"""
-        logger.debug("Pre-loading existing folder structure...")
+        """Preload all existing form folders to minimize API calls.
+        Only caches form-level folders; subfolders (photos, geojson) are looked up on demand."""
+        logger.info("Pre-loading existing folder structure...")
 
         # List all folders in active_forms and inactive_forms
         for parent_name, parent_id in [("active_forms", self.active_forms_id), ("inactive_forms", self.inactive_forms_id)]:
@@ -430,7 +431,7 @@ class FulcrumToDriveExporter:
                 continue
 
             # Get all form folders
-            form_folders = {}
+            form_count = 0
             page_token = None
             while True:
                 results = self.drive_service.files().list(
@@ -442,8 +443,7 @@ class FulcrumToDriveExporter:
                 ).execute()
 
                 for f in results.get('files', []):
-                    form_folders[f['name']] = f['id']
-                    # Cache the folder ID
+                    form_count += 1
                     cache_key = f"{parent_id}/{f['name']}"
                     self._folder_cache[cache_key] = f['id']
 
@@ -451,29 +451,9 @@ class FulcrumToDriveExporter:
                 if not page_token:
                     break
 
-            logger.debug(f"  Found {len(form_folders)} existing {parent_name} folders")
+            logger.info(f"  Found {form_count} existing {parent_name} folders")
 
-            # For each form folder, get its subfolders (photos, geojson)
-            for form_name, form_id in form_folders.items():
-                page_token = None
-                while True:
-                    results = self.drive_service.files().list(
-                        q=f"'{form_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                        spaces='drive',
-                        fields='nextPageToken, files(id, name)',
-                        pageSize=100,
-                        pageToken=page_token
-                    ).execute()
-
-                    for f in results.get('files', []):
-                        cache_key = f"{form_id}/{f['name']}"
-                        self._folder_cache[cache_key] = f['id']
-
-                    page_token = results.get('nextPageToken')
-                    if not page_token:
-                        break
-
-        logger.debug(f"  Cached {len(self._folder_cache)} folder IDs")
+        logger.info(f"  Cached {len(self._folder_cache)} folder IDs")
 
     def _load_photo_progress(self):
         """Load previously uploaded photos from progress file"""
