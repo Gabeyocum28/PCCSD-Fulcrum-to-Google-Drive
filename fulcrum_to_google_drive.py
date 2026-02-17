@@ -755,8 +755,8 @@ class FulcrumToDriveExporter:
             return
 
         # Sort by failed count (most failures first)
-        sorted_forms = sorted(self.failed_forms, key=lambda x: x['failed_count'], reverse=True)
-        total_failed = sum(f['failed_count'] for f in sorted_forms)
+        sorted_forms = sorted(self.failed_forms, key=lambda x: x['photos_failed'], reverse=True)
+        total_failed = sum(f['photos_failed'] for f in sorted_forms)
 
         summary_lines = [
             "=" * 70,
@@ -765,7 +765,7 @@ class FulcrumToDriveExporter:
             "",
             f"Generated: {datetime.now(UTAH_TZ).isoformat()}",
             f"Total Forms with Failed Photos: {len(sorted_forms)}",
-            f"Total Failed Photos: {total_failed}",
+            f"Total Photos Failed: {total_failed}",
             "",
             "-" * 70,
             "FORMS WITH FAILED PHOTO DOWNLOADS",
@@ -777,7 +777,9 @@ class FulcrumToDriveExporter:
             summary_lines.extend([
                 f"{idx}. {form_info['name']}",
                 f"   Status: {form_info['status']}",
-                f"   Failed Photos: {form_info['failed_count']}",
+                f"   Total Photos in Fulcrum: {form_info['photos_in_fulcrum']}",
+                f"   Total Photos in Drive: {form_info['photos_in_drive']}",
+                f"   Photos Failed: {form_info['photos_failed']}",
                 f"   Location: {form_info['path']}/FORM_SUMMARY.txt",
                 ""
             ])
@@ -1236,8 +1238,9 @@ class FulcrumToDriveExporter:
         form_name = form['name']
         is_active = form.get('_is_active', True)
 
-        # Sanitize form name
+        # Sanitize form name and append form ID for uniqueness
         safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in form_name)
+        safe_name = f"{safe_name}_{form_id}"
 
         logger.debug(f"Processing form: {form_name}")
 
@@ -1489,7 +1492,9 @@ class FulcrumToDriveExporter:
             self.failed_forms.append({
                 "name": form_name,
                 "status": "ACTIVE" if is_active else "INACTIVE",
-                "failed_count": len(failed_photos),
+                "photos_in_fulcrum": len(all_photos),
+                "photos_in_drive": photos_in_drive,
+                "photos_failed": len(failed_photos),
                 "path": f"{folder_type}/{safe_name}"
             })
         # Always update the summary (removes file if no failures remain)
@@ -1791,6 +1796,7 @@ class FulcrumToDriveExporter:
 
             form_name = form['name']
             safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in form_name)
+            safe_name = f"{safe_name}_{form['id']}"
 
             # Quick check: skip if form folder already exists
             if self.quick_check:
