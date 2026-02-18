@@ -34,7 +34,7 @@ load_dotenv()
 
 # Timeout configuration (in seconds)
 # GitHub Actions has 6-hour limit; we save state at 5h45m to allow graceful exit
-WORKFLOW_TIMEOUT_SECONDS = 5 * 60 * 60 + 45 * 60  # 5 hours 45 minutes
+WORKFLOW_TIMEOUT_SECONDS = 5 * 60 * 60  # 5 hours (save state early to avoid 6-hour GitHub Actions limit)
 
 # Utah timezone (Mountain Time)
 UTAH_TZ = ZoneInfo('America/Denver')
@@ -605,6 +605,24 @@ class FulcrumToDriveExporter:
         except HttpError as e:
             logger.debug(f"Error deleting {filename}: {e}")
             return False
+
+    def _delete_csvs_in_folder(self, folder_id: str) -> int:
+        """Delete all CSV files in a Drive folder. Returns count deleted."""
+        try:
+            query = f"'{folder_id}' in parents and trashed=false and mimeType='text/csv'"
+            results = self.drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+            files = results.get('files', [])
+            deleted = 0
+            for f in files:
+                try:
+                    self.drive_service.files().delete(fileId=f['id']).execute()
+                    deleted += 1
+                except HttpError as e:
+                    logger.debug(f"Error deleting CSV {f['name']}: {e}")
+            return deleted
+        except HttpError as e:
+            logger.debug(f"Error listing CSVs in folder: {e}")
+            return 0
 
     def cleanup_deleted_photos(self, photos_folder_id: str, photo_metadata_cache: Dict[str, Dict], form_name: str = "Unknown") -> tuple:
         """Remove photos from Drive that were deleted in Fulcrum
@@ -1344,9 +1362,11 @@ class FulcrumToDriveExporter:
         writer.writeheader()
         writer.writerows(all_flat_records)
 
-        # Upload CSV (delete existing first to replace)
+        # Remove all old CSVs from the form folder before uploading fresh ones
+        self._delete_csvs_in_folder(form_folder_id)
+
+        # Upload data CSV
         csv_filename = f"{safe_name}_data.csv"
-        self._delete_file_if_exists(csv_filename, form_folder_id)
         csv_content = csv_buffer.getvalue().encode('utf-8')
         self._upload_to_drive(csv_content, csv_filename, form_folder_id, "text/csv")
 
@@ -1432,24 +1452,12 @@ class FulcrumToDriveExporter:
 
                 failed_photos = still_failed
 
-        # Build and upload photos CSVs (delete existing first to replace)
+        # Build and upload photos CSV (old CSVs already cleared above)
         if all_photo_results:
-            all_csv, before_csv, completed_csv = self.build_photos_csv(all_photo_results)
+            all_csv, _, _ = self.build_photos_csv(all_photo_results)
 
             if all_csv:
-                photos_csv_name = f"{safe_name}_photos.csv"
-                self._delete_file_if_exists(photos_csv_name, form_folder_id)
-                self._upload_to_drive(all_csv, photos_csv_name, form_folder_id, "text/csv")
-
-            if before_csv:
-                before_csv_name = f"{safe_name}_before_photos.csv"
-                self._delete_file_if_exists(before_csv_name, form_folder_id)
-                self._upload_to_drive(before_csv, before_csv_name, form_folder_id, "text/csv")
-
-            if completed_csv:
-                completed_csv_name = f"{safe_name}_completed_photos.csv"
-                self._delete_file_if_exists(completed_csv_name, form_folder_id)
-                self._upload_to_drive(completed_csv, completed_csv_name, form_folder_id, "text/csv")
+                self._upload_to_drive(all_csv, f"{safe_name}_photos.csv", form_folder_id, "text/csv")
 
         # Count actual photos in Drive after cleanup and uploads (bypass cache - contents changed)
         photos_in_drive = len(self._list_drive_folder_contents(photos_folder_id, use_cache=False))
@@ -1486,13 +1494,6 @@ class FulcrumToDriveExporter:
 
         if all_photo_results:
             summary_lines.append(f"- {safe_name}_photos.csv")
-            # Check if before/completed CSVs were created
-            before_count = sum(1 for r in all_photo_results if r.get('success') and 'before' in r.get('field_path', '').lower())
-            completed_count = sum(1 for r in all_photo_results if r.get('success') and any(x in r.get('field_path', '').lower() for x in ['completed', 'after', 'complete']))
-            if before_count > 0:
-                summary_lines.append(f"- {safe_name}_before_photos.csv ({before_count} photos)")
-            if completed_count > 0:
-                summary_lines.append(f"- {safe_name}_completed_photos.csv ({completed_count} photos)")
 
         summary_lines.append("")
 
